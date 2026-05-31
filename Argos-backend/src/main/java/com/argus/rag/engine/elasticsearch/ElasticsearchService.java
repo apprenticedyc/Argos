@@ -2,22 +2,30 @@ package com.argus.rag.engine.elasticsearch;
 
 import com.argus.rag.common.exception.BusinessException;
 import com.argus.rag.ingestion.model.entity.DocumentChunkEntity;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.client.indices.CreateIndexRequest;
+import org.elasticsearch.client.indices.GetIndexRequest;
+import org.elasticsearch.index.reindex.DeleteByQueryRequest;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentFactory;
+import org.elasticsearch.index.query.BoolQueryBuilder;
+import org.elasticsearch.index.query.Operator;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.rescore.QueryRescoreMode;
+import org.elasticsearch.search.rescore.QueryRescorerBuilder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -47,8 +55,7 @@ import java.util.Map;
  *   <li>检索失败不抛异常，降级返回空列表（保证服务不中断）</li>
  * </ul>
  * <p>
- * <b>通信方式：</b>通过 JDK 原生 {@link HttpClient} 直接调用 ES REST API，
- * 无第三方 ES 客户端依赖。
+ * <b>通信方式：</b>通过 Elasticsearch {@link RestHighLevelClient} 调用 ES REST API。
  *
  * @author Argus-RAG Team
  * @see KeywordHit 关键词检索命中结果记录
@@ -57,24 +64,14 @@ import java.util.Map;
 @Slf4j
 public class ElasticsearchService {
 
-
-    /** HTTP 请求超时时间，平衡响应速度和 ES 集群压力 */
-    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
-
     /** 关键词分数归一化的参考基准值，用于对数变换 */
     private static final double KEYWORD_SCORE_REFERENCE = 100D;
 
     /** ES 索引中文档切片的有效状态标识 */
     private static final String READY_STATUS = "READY";
 
-    /** JSON 序列化 / 反序列化工具 */
-    private final ObjectMapper objectMapper;
-
-    /** JDK 原生 HTTP 客户端，复用连接池 */
-    private final HttpClient httpClient;
-
-    /** ES 基础 URL（scheme + host + port），如 {@code http://localhost:9200} */
-    private final String baseUrl;
+    /** Elasticsearch 高级 REST 客户端 */
+    private final RestHighLevelClient client;
 
     /** ES 索引名称 */
     private final String indexName;
@@ -83,53 +80,17 @@ public class ElasticsearchService {
     private volatile boolean indexInitialized;
 
     /**
-     * Spring 构造注入，通过 {@code @Value} 读取 ES 连接配置。
+     * Spring 构造注入，通过 {@code @Value} 读取 ES 索引名称配置。
      *
-     * @param objectMapper Jackson ObjectMapper
-     * @param host         ES 主机地址，默认 {@code localhost}
-     * @param port         ES 端口，默认 {@code 9200}
-     * @param scheme       ES 协议，默认 {@code http}
-     * @param indexName    ES 索引名称，默认 {@code dd_rag_document_chunks}
+     * @param elasticsearchClient ES 高级 REST 客户端（由 {@link ElasticsearchConfiguration} 提供）
+     * @param indexName           ES 索引名称，默认 {@code dd_rag_document_chunks}
      */
     @Autowired
     public ElasticsearchService(
-            ObjectMapper objectMapper,
-            @Value("${elasticsearch.host:localhost}") String host,
-            @Value("${elasticsearch.port:9200}") int port,
-            @Value("${elasticsearch.scheme:http}") String scheme,
+            RestHighLevelClient elasticsearchClient,
             @Value("${elasticsearch.index-name:dd_rag_document_chunks}") String indexName
     ) {
-        this(
-                objectMapper,
-                HttpClient.newBuilder().connectTimeout(REQUEST_TIMEOUT).build(),
-                host,
-                port,
-                scheme,
-                indexName
-        );
-    }
-
-    /**
-     * 包私有构造器，用于测试时注入 mock {@link HttpClient}。
-     *
-     * @param objectMapper Jackson ObjectMapper
-     * @param httpClient   JDK HTTP 客户端实例
-     * @param host         ES 主机
-     * @param port         ES 端口
-     * @param scheme       ES 协议
-     * @param indexName    ES 索引名称
-     */
-    ElasticsearchService(
-            ObjectMapper objectMapper,
-            HttpClient httpClient,
-            String host,
-            int port,
-            String scheme,
-            String indexName
-    ) {
-        this.objectMapper = objectMapper;
-        this.httpClient = httpClient;
-        this.baseUrl = "%s://%s:%d".formatted(scheme, host, port);
+        this.client = elasticsearchClient;
         this.indexName = indexName;
     }
 
@@ -164,14 +125,12 @@ public class ElasticsearchService {
             return;
         }
         ensureIndexInitialized();
-        String path = "/%s/_delete_by_query".formatted(indexName);
-        Map<String, Object> requestBody = Map.of(
-                "query", Map.of("term", Map.of("documentId", documentId))
-        );
         try {
-            sendJsonRequest("POST", path, requestBody, true);
+            DeleteByQueryRequest request = new DeleteByQueryRequest(indexName);
+            request.setQuery(QueryBuilders.termQuery("documentId", documentId));
+            client.deleteByQuery(request, RequestOptions.DEFAULT);
             log.info("ES 文档切片索引删除完成: documentId={}", documentId);
-        } catch (RuntimeException exception) {
+        } catch (IOException | RuntimeException exception) {
             log.warn("ES 文档切片索引删除失败: documentId={}, reason={}", documentId, exception.getMessage());
         }
     }
@@ -205,38 +164,24 @@ public class ElasticsearchService {
         }
         ensureIndexInitialized();
         long startNano = System.nanoTime();
-        // 2. 构造 ES 请求体：按 groupId 过滤 + match 查询 + topK
-        Map<String, Object> requestBody = buildKeywordSearchRequestBody(groupId, question, topK);
         try {
-            // 3. 发送 HTTP 请求到 ES _search API
-            JsonNode root = sendJsonRequest("POST", "/%s/_search".formatted(indexName), requestBody, true);
-            JsonNode hitsNode = root.path("hits").path("hits");
-            if (!hitsNode.isArray() || hitsNode.isEmpty()) {
-                long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
-                log.info("关键词检索完成: groupId={}, topK={}, hitCount=0, elapsedMs={}", groupId, topK, elapsedMs);
-                return List.of();
-            }
-            // 4. 解析 ES 响应，提取文档字段和评分，转为领域对象
-            List<KeywordHit> hits = new ArrayList<>();
-            for (JsonNode hitNode : hitsNode) {
-                JsonNode sourceNode = hitNode.path("_source");
-                double rawScore = hitNode.path("_score").asDouble(0D);
-                hits.add(new KeywordHit(
-                        sourceNode.path("documentId").asLong(),
-                        sourceNode.path("chunkId").asLong(),
-                        sourceNode.path("chunkIndex").asInt(),
-                        sourceNode.path("fileName").asText(""),
-                        sourceNode.path("chunkText").asText(""),
-                        rawScore,
-                        normalizeKeywordScore(rawScore)
-                ));
-            }
-            long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
-            log.info("关键词检索完成: groupId={}, topK={}, hitCount={}, elapsedMs={}",
-                    groupId, topK, hits.size(), elapsedMs);
-            return List.copyOf(hits);
-        } catch (RuntimeException exception) {
-            // 5. 检索失败时降级返回空结果，不阻断主流程
+            // 2. 构建检索请求：bool query + rescore
+            SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
+                    .size(topK)
+                    .fetchSource(
+                            new String[]{"groupId", "documentId", "chunkId", "chunkIndex", "fileName", "chunkText"},
+                            null
+                    )
+                    .query(buildBoolQuery(groupId, question))
+                    .addRescorer(buildRescoreQuery(question, topK));
+
+            SearchRequest request = new SearchRequest(indexName).source(sourceBuilder);
+            SearchResponse response = client.search(request, RequestOptions.DEFAULT);
+
+            // 3. 解析 ES 响应，提取文档字段和评分，转为领域对象
+            return parseSearchHits(response.getHits().getHits(), groupId, topK, startNano);
+        } catch (IOException | RuntimeException exception) {
+            // 4. 检索失败时降级返回空结果，不阻断主流程
             long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
             log.warn(
                     "ES 关键词检索失败，降级为空结果: groupId={}, question='{}', elapsedMs={}, reason={}",
@@ -250,31 +195,70 @@ public class ElasticsearchService {
     }
 
     /**
+     * 解析 ES 搜索响应中的 hits 数组为领域对象列表。
+     * <p>
+     * 包私有可见性，便于单元测试直接验证解析逻辑。
+     *
+     * @param hits      ES 返回的 SearchHit 数组
+     * @param groupId   群组 ID（用于日志）
+     * @param topK      请求的最大结果数（用于日志）
+     * @param startNano 检索开始时间戳（用于计算耗时）
+     * @return 解析后的 KeywordHit 列表，hits 为空时返回空列表
+     */
+    List<KeywordHit> parseSearchHits(SearchHit[] hits, Long groupId, int topK, long startNano) {
+        if (hits.length == 0) {
+            long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
+            log.info("关键词检索完成: groupId={}, topK={}, hitCount=0, elapsedMs={}", groupId, topK, elapsedMs);
+            return List.of();
+        }
+        List<KeywordHit> result = new ArrayList<>();
+        for (SearchHit hit : hits) {
+            Map<String, Object> source = hit.getSourceAsMap();
+            double rawScore = hit.getScore();
+            result.add(new KeywordHit(
+                    toLong(source.get("documentId")),
+                    toLong(source.get("chunkId")),
+                    toInt(source.get("chunkIndex")),
+                    toStr(source.get("fileName")),
+                    toStr(source.get("chunkText")),
+                    rawScore,
+                    normalizeKeywordScore(rawScore)
+            ));
+        }
+        long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
+        log.info("关键词检索完成: groupId={}, topK={}, hitCount={}, elapsedMs={}",
+                groupId, topK, result.size(), elapsedMs);
+        return List.copyOf(result);
+    }
+
+    /**
      * 将单条文档切片写入 ES。
      * <p>
      * 写入前调用 {@link #validateChunk} 校验必要字段完整性。
-     * 使用 {@code PUT /index/_doc/{chunkId}} 确保相同 chunkId 幂等覆盖。
+     * 使用 {@link IndexRequest} 指定文档 ID 确保相同 chunkId 幂等覆盖。
      *
      * @param fileName 原始文件名
      * @param chunk    文档切片实体
      */
     private void indexChunk(String fileName, DocumentChunkEntity chunk) {
         validateChunk(chunk);
-        Map<String, Object> requestBody = new LinkedHashMap<>();
-        requestBody.put("chunkId", chunk.getId());
-        requestBody.put("groupId", chunk.getGroupId());
-        requestBody.put("documentId", chunk.getDocumentId());
-        requestBody.put("chunkIndex", chunk.getChunkIndex());
-        requestBody.put("fileName", fileName);
-        requestBody.put("chunkText", chunk.getChunkText());
-        requestBody.put("status", READY_STATUS);
-        requestBody.put("deleted", false);
-        sendJsonRequest(
-                "PUT",
-                "/%s/_doc/%s".formatted(indexName, URLEncoder.encode(String.valueOf(chunk.getId()), StandardCharsets.UTF_8)),
-                requestBody,
-                false
-        );
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("chunkId", chunk.getId());
+        document.put("groupId", chunk.getGroupId());
+        document.put("documentId", chunk.getDocumentId());
+        document.put("chunkIndex", chunk.getChunkIndex());
+        document.put("fileName", fileName);
+        document.put("chunkText", chunk.getChunkText());
+        document.put("status", READY_STATUS);
+        document.put("deleted", false);
+        try {
+            IndexRequest request = new IndexRequest(indexName)
+                    .id(String.valueOf(chunk.getId()))
+                    .source(document);
+            client.index(request, RequestOptions.DEFAULT);
+        } catch (IOException e) {
+            throw new BusinessException("ES 索引写入失败: chunkId=" + chunk.getId(), e);
+        }
     }
 
     /**
@@ -326,55 +310,70 @@ public class ElasticsearchService {
     /**
      * 检查 ES 索引是否存在。
      * <p>
-     * 发送 HEAD 请求到 ES，200 表示存在，404 表示不存在，其他状态码视为检查失败。
-     * 正确处理了线程中断信号（恢复中断状态后抛异常）。
+     * 使用 {@link RestHighLevelClient#indices()} 的 exists API，
+     * 返回 true 表示存在，false 表示不存在。
      *
      * @return {@code true} 索引已存在，{@code false} 索引不存在
-     * @throws BusinessException ES 通信失败或返回非预期状态码时抛出
+     * @throws BusinessException ES 通信失败时抛出
      */
     private boolean indexExists() {
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + "/%s".formatted(indexName)))
-                    .timeout(REQUEST_TIMEOUT)
-                    .method("HEAD", HttpRequest.BodyPublishers.noBody())
-                    .build();
-            HttpResponse<String> response =
-                    httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            if (response.statusCode() == 200) {
-                return true;
-            }
-            if (response.statusCode() == 404) {
-                return false;
-            }
-            throw new BusinessException("ES 索引检查失败: " + response.statusCode());
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new BusinessException("ES 索引检查失败", exception);
-        } catch (IOException exception) {
-            throw new BusinessException("ES 索引检查失败", exception);
+            GetIndexRequest request = new GetIndexRequest(indexName);
+            return client.indices().exists(request, RequestOptions.DEFAULT);
+        } catch (IOException e) {
+            throw new BusinessException("ES 索引检查失败", e);
         }
     }
 
     /**
      * 创建 ES 索引，使用自定义的 IK 中文分词器配置。
      * <p>
-     * 调用 {@link #buildCreateIndexRequestBody} 生成索引定义 JSON，
-     * 包含 mappings 字段类型定义和 analysis 分词器配置。
+     * 使用 {@link XContentBuilder} 定义 settings（分词器）和 mappings（字段类型）。
      */
     private void createIndex() {
-        sendJsonRequest("PUT", "/%s".formatted(indexName), buildCreateIndexRequestBody(), false);
-        log.info("ES 索引初始化完成: {}", indexName);
+        try (XContentBuilder settings = buildSettingsBuilder();
+             XContentBuilder mappings = buildMappingsBuilder()) {
+            CreateIndexRequest request = new CreateIndexRequest(indexName);
+            request.settings(settings);
+            request.mapping(mappings);
+            client.indices().create(request, RequestOptions.DEFAULT);
+            log.info("ES 索引初始化完成: {}", indexName);
+        } catch (IOException e) {
+            throw new BusinessException("ES 索引创建失败", e);
+        }
     }
 
     /**
-     * 构建 ES 索引创建请求体（settings + mappings）。
+     * 构建 ES 索引 settings（analysis 分词器配置）。
      * <p>
      * <b>Analysis 配置：</b>
      * <ul>
      *   <li>{@code ddrag_ik_index} —— 索引端使用 IK 最大切分（ik_max_word），提高召回覆盖率</li>
      *   <li>{@code ddrag_ik_search} —— 查询端使用 IK 智能切分（ik_smart），提高精确度</li>
      * </ul>
+     *
+     * @return XContentBuilder 索引 settings 定义
+     */
+    XContentBuilder buildSettingsBuilder() throws IOException {
+        return XContentFactory.jsonBuilder()
+                .startObject()
+                    .startObject("analysis")
+                        .startObject("analyzer")
+                            .startObject("ddrag_ik_index")
+                                .field("type", "custom")
+                                .field("tokenizer", "ik_max_word")
+                            .endObject()
+                            .startObject("ddrag_ik_search")
+                                .field("type", "custom")
+                                .field("tokenizer", "ik_smart")
+                            .endObject()
+                        .endObject()
+                    .endObject()
+                .endObject();
+    }
+
+    /**
+     * 构建 ES 索引 mappings（字段类型定义）。
      * <p>
      * <b>Mappings 字段：</b>
      * <ul>
@@ -385,109 +384,41 @@ public class ElasticsearchService {
      *   <li>{@code fileName} —— text 类型，双字段（原字段 + keyword 子字段）</li>
      *   <li>{@code chunkText} —— text 类型，IK 中文分词</li>
      * </ul>
-     * <p>
-     * <b>可见性：</b>包私有，供单元测试验证索引定义。
      *
-     * @return ES 索引创建请求体 Map
+     * @return XContentBuilder 索引 mappings 定义
      */
-    Map<String, Object> buildCreateIndexRequestBody() {
-        return Map.of(
-                "settings", Map.of(
-                        "analysis", Map.of(
-                                "analyzer", Map.of(
-                                        "ddrag_ik_index", Map.of(
-                                                "type", "custom",
-                                                "tokenizer", "ik_max_word"
-                                        ),
-                                        "ddrag_ik_search", Map.of(
-                                                "type", "custom",
-                                                "tokenizer", "ik_smart"
-                                        )
-                                )
-                        )
-                ),
-                "mappings", Map.of(
-                        "properties", Map.of(
-                                "groupId", Map.of("type", "long"),
-                                "documentId", Map.of("type", "long"),
-                                "chunkId", Map.of("type", "long"),
-                                "chunkIndex", Map.of("type", "integer"),
-                                "status", Map.of("type", "keyword"),
-                                "deleted", Map.of("type", "boolean"),
-                                "fileName", Map.of(
-                                        "type", "text",
-                                        "analyzer", "ddrag_ik_index",
-                                        "search_analyzer", "ddrag_ik_search",
-                                        "fields", Map.of(
-                                                "keyword", Map.of(
-                                                        "type", "keyword",
-                                                        "ignore_above", 256
-                                                )
-                                        )
-                                ),
-                                "chunkText", Map.of(
-                                        "type", "text",
-                                        "analyzer", "ddrag_ik_index",
-                                        "search_analyzer", "ddrag_ik_search"
-                                )
-                        )
-                )
-        );
+    XContentBuilder buildMappingsBuilder() throws IOException {
+        return XContentFactory.jsonBuilder()
+                .startObject()
+                    .startObject("properties")
+                        .startObject("groupId").field("type", "long").endObject()
+                        .startObject("documentId").field("type", "long").endObject()
+                        .startObject("chunkId").field("type", "long").endObject()
+                        .startObject("chunkIndex").field("type", "integer").endObject()
+                        .startObject("status").field("type", "keyword").endObject()
+                        .startObject("deleted").field("type", "boolean").endObject()
+                        .startObject("fileName")
+                            .field("type", "text")
+                            .field("analyzer", "ddrag_ik_index")
+                            .field("search_analyzer", "ddrag_ik_search")
+                            .startObject("fields")
+                                .startObject("keyword")
+                                    .field("type", "keyword")
+                                    .field("ignore_above", 256)
+                                .endObject()
+                            .endObject()
+                        .endObject()
+                        .startObject("chunkText")
+                            .field("type", "text")
+                            .field("analyzer", "ddrag_ik_index")
+                            .field("search_analyzer", "ddrag_ik_search")
+                        .endObject()
+                    .endObject()
+                .endObject();
     }
 
     /**
-     * 构建 ES 关键词检索请求体（两阶段打分）。
-     * <p>
-     * <b>结构：</b>
-     * <pre>
-     * {
-     *   "size": topK,
-     *   "_source": ["groupId", "documentId", "chunkId", "chunkIndex", "fileName", "chunkText"],
-     *   "query": { bool: { filter: [...], should: [...], minimum_should_match: 1 } },
-     *   "rescore": { window_size: topK, query: { ... } }
-     * }
-     * </pre>
-     * <p>
-     * <b>可见性：</b>包私有，供单元测试验证检索 DSL。
-     *
-     * @param groupId  群组 ID
-     * @param question 检索文本
-     * @param topK     返回上限
-     * @return ES 检索请求体 Map
-     */
-    Map<String, Object> buildKeywordSearchRequestBody(Long groupId, String question, int topK) {
-        Map<String, Object> boolQuery = Map.of(
-                "filter", List.of(
-                        Map.of("term", Map.of("groupId", groupId)),
-                        Map.of("term", Map.of("status", READY_STATUS)),
-                        Map.of("term", Map.of("deleted", false))
-                ),
-                "should", buildKeywordShouldClauses(question),
-                "minimum_should_match", 1
-        );
-        return Map.of(
-                "size", topK,
-                "_source", List.of("groupId", "documentId", "chunkId", "chunkIndex", "fileName", "chunkText"),
-                "query", Map.of("bool", boolQuery),
-                "rescore", Map.of(
-                        "window_size", topK,
-                        "query", Map.of(
-                                "query_weight", 0.2D,
-                                "rescore_query_weight", 1.0D,
-                                "score_mode", "total",
-                                "rescore_query", Map.of(
-                                        "bool", Map.of(
-                                                "should", buildKeywordRescoreShouldClauses(question),
-                                                "minimum_should_match", 1
-                                        )
-                                )
-                        )
-                )
-        );
-    }
-
-    /**
-     * 构建 ES bool query 中 should 子句列表（初排阶段）。
+     * 构建关键词检索的 bool query（初排阶段）。
      * <p>
      * 四个打分维度：
      * <ol>
@@ -497,87 +428,46 @@ public class ElasticsearchService {
      *   <li>chunkText 分词匹配——boost 3（内容模糊命中）</li>
      * </ol>
      *
+     * @param groupId 群组 ID
      * @param question 检索关键词
-     * @return should 子句列表
+     * @return BoolQueryBuilder
      */
-    private List<Map<String, Object>> buildKeywordShouldClauses(String question) {
-        return List.of(
-                Map.of("match_phrase", Map.of("fileName", Map.of("query", question, "boost", 8))),
-                Map.of("match", Map.of("fileName", Map.of("query", question, "boost", 4))),
-                Map.of("match_phrase", Map.of("chunkText", Map.of("query", question, "boost", 6))),
-                Map.of("match", Map.of("chunkText", Map.of("query", question, "boost", 3)))
-        );
+    private BoolQueryBuilder buildBoolQuery(Long groupId, String question) {
+        return QueryBuilders.boolQuery()
+                .filter(QueryBuilders.termQuery("groupId", groupId))
+                .filter(QueryBuilders.termQuery("status", READY_STATUS))
+                .filter(QueryBuilders.termQuery("deleted", false))
+                .should(QueryBuilders.matchPhraseQuery("fileName", question).boost(8f))
+                .should(QueryBuilders.matchQuery("fileName", question).boost(4f))
+                .should(QueryBuilders.matchPhraseQuery("chunkText", question).boost(6f))
+                .should(QueryBuilders.matchQuery("chunkText", question).boost(3f))
+                .minimumShouldMatch(1);
     }
 
     /**
-     * 构建 ES rescore 阶段的 should 子句列表（精排阶段）。
+     * 构建 rescore 精排查询（二次打分阶段）。
      * <p>
-     * 与初排 {@link #buildKeywordShouldClauses} 的区别：
+     * 与初排 {@link #buildBoolQuery} 的区别：
      * match 子句使用 {@code operator=and} 更严格要求所有词都匹配，
      * 确保精排阶段返回的结果精确度更高。
      *
-     * @param question 检索关键词
-     * @return rescore should 子句列表
+     * @param question  检索关键词
+     * @param windowSize rescore 窗口大小
+     * @return QueryRescorerBuilder
      */
-    private List<Map<String, Object>> buildKeywordRescoreShouldClauses(String question) {
-        return List.of(
-                Map.of("match_phrase", Map.of("fileName", Map.of("query", question, "boost", 8))),
-                Map.of("match", Map.of("fileName", Map.of("query", question, "operator", "and", "boost", 5))),
-                Map.of("match_phrase", Map.of("chunkText", Map.of("query", question, "boost", 7))),
-                Map.of("match", Map.of("chunkText", Map.of("query", question, "operator", "and", "boost", 4)))
-        );
-    }
+    private QueryRescorerBuilder buildRescoreQuery(String question, int windowSize) {
+        BoolQueryBuilder rescoreBool = QueryBuilders.boolQuery()
+                .should(QueryBuilders.matchPhraseQuery("fileName", question).boost(8f))
+                .should(QueryBuilders.matchQuery("fileName", question).operator(Operator.AND).boost(5f))
+                .should(QueryBuilders.matchPhraseQuery("chunkText", question).boost(7f))
+                .should(QueryBuilders.matchQuery("chunkText", question).operator(Operator.AND).boost(4f))
+                .minimumShouldMatch(1);
 
-    /**
-     * 发送 JSON 请求到 ES 并解析响应。
-     * <p>
-     * <b>参数说明：</b>
-     * <ul>
-     *   <li>{@code method} —— HTTP 方法（GET / PUT / POST / DELETE）</li>
-     *   <li>{@code path} —— ES API 路径（如 {@code /index-name/_search}）</li>
-     *   <li>{@code requestBody} —— 请求体 Map，会被序列化为 JSON</li>
-     *   <li>{@code ignoreMissingIndex} —— 为 {@code true} 时，
-     *       若 ES 返回 404（索引不存在）则返回空 JSON 对象而非抛异常</li>
-     * </ul>
-     * <p>
-     * 正确处理了线程中断（恢复中断状态）。
-     *
-     * @param method             HTTP 方法
-     * @param path               ES API 路径
-     * @param requestBody        请求体 Map
-     * @param ignoreMissingIndex 是否忽略索引不存在的 404 错误
-     * @return ES 响应的 JSON 树
-     * @throws BusinessException HTTP 通信失败、ES 返回错误状态码或 JSON 解析失败时抛出
-     */
-    private JsonNode sendJsonRequest(
-            String method,
-            String path,
-            Map<String, Object> requestBody,
-            boolean ignoreMissingIndex
-    ) {
-        try {
-            String body = objectMapper.writeValueAsString(requestBody);
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + path))
-                    .timeout(REQUEST_TIMEOUT)
-                    .header("Content-Type", "application/json")
-                    .method(method, HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                    .build();
-            HttpResponse<String> response =
-                    httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            if (ignoreMissingIndex && response.statusCode() == 404) {
-                return objectMapper.createObjectNode();
-            }
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new BusinessException("ES 请求失败: " + response.statusCode() + ", body=" + response.body());
-            }
-            return objectMapper.readTree(response.body());
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new BusinessException("ES 请求失败", exception);
-        } catch (IOException exception) {
-            throw new BusinessException("ES 请求失败", exception);
-        }
+        return new QueryRescorerBuilder(rescoreBool)
+                .setQueryWeight(0.2f)
+                .setRescoreQueryWeight(1.0f)
+                .setScoreMode(QueryRescoreMode.Total)
+                .windowSize(windowSize);
     }
 
     /**
@@ -612,6 +502,33 @@ public class ElasticsearchService {
             return 0D;
         }
         return Math.min(1D, Math.log1p(rawScore) / Math.log1p(KEYWORD_SCORE_REFERENCE));
+    }
+
+    /**
+     * 将 Object 安全转换为 long，处理 HLRC 反序列化时 Integer/Long 不确定的情况。
+     */
+    private static long toLong(Object value) {
+        if (value instanceof Number n) {
+            return n.longValue();
+        }
+        return 0L;
+    }
+
+    /**
+     * 将 Object 安全转换为 int，处理 HLRC 反序列化时 Integer/Long 不确定的情况。
+     */
+    private static int toInt(Object value) {
+        if (value instanceof Number n) {
+            return n.intValue();
+        }
+        return 0;
+    }
+
+    /**
+     * 将 Object 安全转换为 String，null 值返回空字符串。
+     */
+    private static String toStr(Object value) {
+        return value != null ? value.toString() : "";
     }
 
     /**

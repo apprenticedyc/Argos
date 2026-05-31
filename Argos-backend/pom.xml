@@ -138,6 +138,13 @@
             </exclusions>
         </dependency>
 
+        <!-- Elasticsearch REST High-Level Client (matches ES 7.17.x server) -->
+        <dependency>
+            <groupId>org.elasticsearch.client</groupId>
+            <artifactId>elasticsearch-rest-high-level-client</artifactId>
+            <version>7.17.27</version>
+        </dependency>
+
         <!-- 测试依赖 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
