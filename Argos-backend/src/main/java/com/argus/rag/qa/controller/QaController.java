@@ -118,8 +118,9 @@ public class QaController {
                     .doOnComplete(() -> {
                         try {
                             List<AskQuestionResponse.Citation> citations = citationAssembler
-                                    .assembleDocuments(streamContext.documents());
+                                    .assemble(streamContext.documents());
                             if (!citations.isEmpty()) {
+                                // 将引用来源列表作为一个事件发送，客户端在接收到 complete 事件后可以获取完整回答并展示引用来源
                                 emitter.send(SseEmitter.event().name("citations").data(citations));
                             }
                             emitter.complete();

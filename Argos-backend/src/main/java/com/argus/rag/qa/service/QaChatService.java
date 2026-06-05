@@ -103,28 +103,6 @@ public class QaChatService {
     }
 
     /**
-     * 执行知识问答流程。
-     * <p>
-     * 1. 检索相关证据文档；<br>
-     * 2. 若无证据，直接返回拒答响应；<br>
-     * 3. 调用大模型生成结构化回答；<br>
-     * 4. 解析失败时返回格式错误响应；<br>
-     * 5. 模型拒答时返回拒答响应；<br>
-     * 6. 成功回答时组装引用来源。
-     * </p>
-     *
-     * @param groupId  群组 ID
-     * @param question 用户问题
-     * @return 问答响应
-     */
-    /**
-     * 执行知识问答流程（保留旧签名以保持兼容）。
-     */
-    public AskQuestionResponse ask(Long groupId, String question) {
-        return askWithUsage(groupId, question).response();
-    }
-
-    /**
      * 执行知识问答流程，返回带用量信息的结果。
      * 1. 计时开始 — 记录起始时间戳，用于统计延迟
      * 2. 混合检索 — 调用 documentRetriever.retrieveEvidence() 执行向量+关键词混合检索，返回证据包（文档列表 + 证据等级）
@@ -173,7 +151,7 @@ public class QaChatService {
         return new AskResult(
                 AskQuestionResponse.answered(
                         result.output().answer().trim(),
-                        citationAssembler.assembleDocuments(documents)),
+                        citationAssembler.assemble(documents)),
                 new UsageInfo(result.usage.promptTokens(), result.usage.completionTokens(),
                         result.usage.totalTokens(), result.usage.estimated(), elapsedMs));
     }
@@ -190,6 +168,7 @@ public class QaChatService {
             String question,
             RetrievedEvidenceBundle evidenceBundle) {
         Prompt userPrompt = createUserPrompt(question, evidenceBundle);
+        String rawText = null;
         try {
             ChatResponse chatResponse = qaChatClient.prompt(userPrompt)
                     .advisors(advisor -> advisor
@@ -199,30 +178,47 @@ public class QaChatService {
                                     evidenceBundle.documents()))
                     .call()
                     .chatResponse();
-            String text = chatResponse.getResult().getOutput().getText();
+            rawText = chatResponse.getResult().getOutput().getText();
             UsageInfo usageInfo = extractUsageInfo(chatResponse.getMetadata().getUsage(), false);
-            KnowledgeAnswerOutput output = objectMapper.readValue(text, KnowledgeAnswerOutput.class);
+            KnowledgeAnswerOutput output = objectMapper.readValue(rawText, KnowledgeAnswerOutput.class);
             return new LlmCallResult(output, usageInfo);
         } catch (RuntimeException | JsonProcessingException exception) {
             log.warn(
-                    "QA structured output failed, fallback to raw content. groupId={}, evidenceCount={}",
+                    "QA structured output failed, fallback with error feedback. groupId={}, evidenceCount={}",
                     groupId,
                     evidenceBundle.documents().size(),
                     exception);
-            return parseFallbackAnswer(groupId, question, evidenceBundle);
+            return parseFallbackAnswer(groupId, question, evidenceBundle, rawText, exception.getMessage());
         }
     }
 
     /**
-     * 回退解析：当结构化输出失败时，调用大模型获取原始文本并用 {@link QaAnswerParser} 解析。
+     * 回退解析：当结构化输出失败时，携带上次错误信息重新调用 LLM，引导其修正输出格式。
+     *
+     * @param groupId        群组 ID
+     * @param question       用户问题
+     * @param evidenceBundle 证据包
+     * @param rawText        上次 LLM 输出的原始文本（可能为 null）
+     * @param errorMessage   上次解析失败的错误信息
      */
     private LlmCallResult parseFallbackAnswer(
             Long groupId,
             String question,
-            RetrievedEvidenceBundle evidenceBundle) {
+            RetrievedEvidenceBundle evidenceBundle,
+            String rawText,
+            String errorMessage) {
         Prompt userPrompt = createUserPrompt(question, evidenceBundle);
+        // 追加纠错提示，告诉 LLM 上次输出的问题，引导它修正
+        StringBuilder feedbackBuilder = new StringBuilder();
+        feedbackBuilder.append("\n\n你上次的输出无法解析为 JSON，请修正格式重新输出。");
+        feedbackBuilder.append("错误原因：").append(errorMessage);
+        if (StringUtils.hasText(rawText)) {
+            feedbackBuilder.append("\n你上次的输出内容：").append(rawText);
+        }
+        String feedback = feedbackBuilder.toString();
+        Prompt feedbackPrompt = new Prompt(userPrompt.getContents() + feedback);
         try {
-            ChatResponse chatResponse = qaChatClient.prompt(userPrompt)
+            ChatResponse chatResponse = qaChatClient.prompt(feedbackPrompt)
                     .advisors(advisor -> advisor
                             .param("groupId", groupId)
                             .param(
@@ -272,27 +268,6 @@ public class QaChatService {
      * @param documents   检索到的文档列表，用于后续组装引用来源
      */
     public record StreamContext(Flux<String> tokenStream, List<Document> documents) {
-    }
-
-    /**
-     * 执行流式知识问答流程。
-     * <p>
-     * 与 {@link #ask(Long, String)} 流程一致：
-     * 检索证据 → 若无证据则返回错误流 → 构造 Prompt → 调用大模型流式生成回答。
-     * 区别在于大模型生成阶段使用流式调用，将回答以 token 流的形式返回。
-     * </p>
-     * <p>
-     * 返回的 {@link StreamContext} 中：<br>
-     * {@code tokenStream} — 大模型逐 token 输出的文本流；<br>
-     * {@code documents} — 检索到的证据文档，供调用方在流结束后组装引用来源。
-     * </p>
-     *
-     * @param groupId  群组 ID
-     * @param question 用户问题
-     * @return 流式问答上下文，包含 token 流和检索文档
-     */
-    public StreamContext askStream(Long groupId, String question) {
-        return askStream(groupId, question, null);
     }
 
     /**

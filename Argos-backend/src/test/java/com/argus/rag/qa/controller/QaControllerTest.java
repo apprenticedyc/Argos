@@ -90,7 +90,7 @@ class QaControllerTest {
     @BeforeEach
     void setUp() {
         // 默认 CitationAssembler 返回空列表
-        when(citationAssembler.assembleDocuments(any())).thenReturn(List.of());
+        when(citationAssembler.assemble(any())).thenReturn(List.of());
     }
 
     // ──────────────────────────────────────────────
@@ -110,7 +110,7 @@ class QaControllerTest {
             List<AskQuestionResponse.Citation> citations = List.of(
                     new AskQuestionResponse.Citation(1L, 10L, 0, "doc.pdf", 0.95, null));
 
-            when(citationAssembler.assembleDocuments(documents)).thenReturn(citations);
+            when(citationAssembler.assemble(documents)).thenReturn(citations);
             when(qaService.askStream(any(), any(AskQuestionRequest.class)))
                     .thenReturn(streamContext(
                             Flux.just("上传流程", "分", "三个阶段", "：", "准备、", "上传、", "验证。"),

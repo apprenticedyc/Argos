@@ -58,7 +58,7 @@ public class ReadyChunkDocumentRetriever implements DocumentRetriever {
 
     /**
      * 实现 {@link DocumentRetriever} 接口，供 RAG 顾问调用。
-     * <p>优先使用上下文中的预取文档，否则执行实际检索。</p>
+     * <p>优先使用上下文中的预取文档，否则委托 {@link HybridRetrievalService} 执行实际检索。</p>
      *
      * @param query 检索请求，包含问题文本和上下文（groupId 等）
      * @return 检索到的文档列表
@@ -71,18 +71,7 @@ public class ReadyChunkDocumentRetriever implements DocumentRetriever {
         if (prefetchedDocuments != null) {
             return prefetchedDocuments;
         }
-        return retrieve(groupId, query.text());
-    }
-
-    /**
-     * 指定群组和问题执行检索，返回文档列表。
-     *
-     * @param groupId  群组 ID
-     * @param question 用户问题
-     * @return 检索到的文档列表
-     */
-    public List<Document> retrieve(Long groupId, String question) {
-        return retrieveEvidence(groupId, question).documents();
+        return retrieveEvidence(groupId, query.text()).documents();
     }
 
     /**

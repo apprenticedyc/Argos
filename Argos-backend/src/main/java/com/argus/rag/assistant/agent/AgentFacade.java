@@ -64,8 +64,8 @@ public class AgentFacade {
         String instruction = systemPromptBuilder.buildSystemPrompt(userId, sessionId, toolMode, groupId);
         RunnableConfig runnableConfig = assistantRunnableConfigFactory.create(userId, sessionId, toolMode, groupId);
         // 当前虽然是“仅对话模式”，底层仍然使用 ReactAgent，只是 system prompt 已改成纯对话风格。
-        KnowledgeSearchToolResultCache resultHolder = new KnowledgeSearchToolResultCache();
-        ReactAgent agent = reactAgentFactory.createAgent(instruction, toolMode, groupId, resultHolder);
+        KnowledgeSearchToolResultCache toolResult = new KnowledgeSearchToolResultCache();
+        ReactAgent agent = reactAgentFactory.createAgent(instruction, toolMode, groupId, toolResult);
         AssistantMessage assistantMessage;
         try {
             assistantMessage = agent.call(userMessage, runnableConfig);
@@ -79,7 +79,8 @@ public class AgentFacade {
         if (assistantMessage == null || assistantMessage.getText() == null || assistantMessage.getText().isBlank()) {
             throw new BusinessException("助手返回内容为空");
         }
-        return new AgentResult(assistantMessage.getText(), resultHolder.currentCitations());
+        // 💥💥💥最后返回结果包含工具结果缓存中的引用列表，供前端展示使用。
+        return new AgentResult(assistantMessage.getText(), toolResult.currentCitations());
     }
 
     /**
@@ -101,8 +102,9 @@ public class AgentFacade {
                                   String userMessage, Consumer<String> sseMessageConsumer) {
         String instruction = systemPromptBuilder.buildSystemPrompt(userId, sessionId, toolMode, groupId);
         RunnableConfig runnableConfig = assistantRunnableConfigFactory.create(userId, sessionId, toolMode, groupId);
-        KnowledgeSearchToolResultCache resultHolder = new KnowledgeSearchToolResultCache();
-        ReactAgent agent = reactAgentFactory.createAgent(instruction, toolMode, groupId, resultHolder);
+        // 缓存工具调用结果, 给 AgentFacade 最后构建响应时用，把引用传给前端
+        KnowledgeSearchToolResultCache toolResult = new KnowledgeSearchToolResultCache();
+        ReactAgent agent = reactAgentFactory.createAgent(instruction, toolMode, groupId, toolResult);
         // 将流式增量文本拼接为完整回复
         StringBuilder finalReply = new StringBuilder();
         try {
@@ -117,7 +119,7 @@ public class AgentFacade {
         if (reply.isBlank()) {
             throw new BusinessException("助手返回内容为空");
         }
-        return new AgentResult(reply, resultHolder.currentCitations());
+        return new AgentResult(reply, toolResult.currentCitations());
     }
 
     /**

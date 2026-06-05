@@ -14,12 +14,9 @@ import org.elasticsearch.index.reindex.DeleteByQueryRequest;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.index.query.BoolQueryBuilder;
-import org.elasticsearch.index.query.Operator;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.search.SearchHit;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
-import org.elasticsearch.search.rescore.QueryRescoreMode;
-import org.elasticsearch.search.rescore.QueryRescorerBuilder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -143,8 +140,6 @@ public class ElasticsearchService {
      *   <li><b>Filter 过滤层：</b>限定 groupId + status=READY + deleted=false</li>
      *   <li><b>Should 召回层：</b>同时对 fileName 和 chunkText 做
      *       match_phrase（短语匹配，boost 6~8）和 match（分词匹配，boost 3~4）</li>
-     *   <li><b>Rescore 精排层：</b>用更严格的 operator=and 算子做二次打分，
-     *       修正初排的位置偏差</li>
      *   <li><b>分数归一化：</b>通过 {@link #normalizeKeywordScore} 将对数变换后的分数
      *       压缩到 [0, 1] 区间</li>
      * </ol>
@@ -165,15 +160,14 @@ public class ElasticsearchService {
         ensureIndexInitialized();
         long startNano = System.nanoTime();
         try {
-            // 2. 构建检索请求：bool query + rescore
+            // 2. 构建检索请求：bool query
             SearchSourceBuilder sourceBuilder = new SearchSourceBuilder()
                     .size(topK)
                     .fetchSource(
                             new String[]{"groupId", "documentId", "chunkId", "chunkIndex", "fileName", "chunkText"},
                             null
                     )
-                    .query(buildBoolQuery(groupId, question))
-                    .addRescorer(buildRescoreQuery(question, topK));
+                    .query(buildBoolQuery(groupId, question));
 
             SearchRequest request = new SearchRequest(indexName).source(sourceBuilder);
             SearchResponse response = client.search(request, RequestOptions.DEFAULT);
@@ -281,16 +275,10 @@ public class ElasticsearchService {
     }
 
     /**
-     * 确保 ES 索引已就绪——不存在则自动创建。
-     * <p>
-     * 采用「双重检查锁定 + volatile」模式：
-     * <ol>
-     *   <li>volatile 读快速路径：{@code indexInitialized} 为 true 直接返回</li>
-     *   <li>获取 {@code synchronized(this)} 锁</li>
-     *   <li>二次检查 volatile 变量（防止竞态窗口期重复初始化）</li>
-     *   <li>调用 {@link #indexExists} 检查，不存在则 {@link #createIndex}</li>
-     *   <li>置位 {@code indexInitialized = true}</li>
-     * </ol>
+     * 初始化ES索引（双重检查锁+volatile）
+     * 外层判断：已初始化则快速返回，提升并发性能
+     * 加锁后二次判断：避免多线程排队重复创建索引
+     * 校验并创建索引，最终更新初始化标记
      */
     private void ensureIndexInitialized() {
         if (indexInitialized) {
@@ -357,18 +345,18 @@ public class ElasticsearchService {
     XContentBuilder buildSettingsBuilder() throws IOException {
         return XContentFactory.jsonBuilder()
                 .startObject()
-                    .startObject("analysis")
-                        .startObject("analyzer")
-                            .startObject("ddrag_ik_index")
-                                .field("type", "custom")
-                                .field("tokenizer", "ik_max_word")
-                            .endObject()
-                            .startObject("ddrag_ik_search")
-                                .field("type", "custom")
-                                .field("tokenizer", "ik_smart")
-                            .endObject()
-                        .endObject()
-                    .endObject()
+                .startObject("analysis")
+                .startObject("analyzer")
+                .startObject("ddrag_ik_index")
+                .field("type", "custom")
+                .field("tokenizer", "ik_max_word")
+                .endObject()
+                .startObject("ddrag_ik_search")
+                .field("type", "custom")
+                .field("tokenizer", "ik_smart")
+                .endObject()
+                .endObject()
+                .endObject()
                 .endObject();
     }
 
@@ -390,35 +378,35 @@ public class ElasticsearchService {
     XContentBuilder buildMappingsBuilder() throws IOException {
         return XContentFactory.jsonBuilder()
                 .startObject()
-                    .startObject("properties")
-                        .startObject("groupId").field("type", "long").endObject()
-                        .startObject("documentId").field("type", "long").endObject()
-                        .startObject("chunkId").field("type", "long").endObject()
-                        .startObject("chunkIndex").field("type", "integer").endObject()
-                        .startObject("status").field("type", "keyword").endObject()
-                        .startObject("deleted").field("type", "boolean").endObject()
-                        .startObject("fileName")
-                            .field("type", "text")
-                            .field("analyzer", "ddrag_ik_index")
-                            .field("search_analyzer", "ddrag_ik_search")
-                            .startObject("fields")
-                                .startObject("keyword")
-                                    .field("type", "keyword")
-                                    .field("ignore_above", 256)
-                                .endObject()
-                            .endObject()
-                        .endObject()
-                        .startObject("chunkText")
-                            .field("type", "text")
-                            .field("analyzer", "ddrag_ik_index")
-                            .field("search_analyzer", "ddrag_ik_search")
-                        .endObject()
-                    .endObject()
+                .startObject("properties")
+                .startObject("groupId").field("type", "long").endObject()
+                .startObject("documentId").field("type", "long").endObject()
+                .startObject("chunkId").field("type", "long").endObject()
+                .startObject("chunkIndex").field("type", "integer").endObject()
+                .startObject("status").field("type", "keyword").endObject()
+                .startObject("deleted").field("type", "boolean").endObject()
+                .startObject("fileName")
+                .field("type", "text")
+                .field("analyzer", "ddrag_ik_index")
+                .field("search_analyzer", "ddrag_ik_search")
+                .startObject("fields")
+                .startObject("keyword")
+                .field("type", "keyword")
+                .field("ignore_above", 256)
+                .endObject()
+                .endObject()
+                .endObject()
+                .startObject("chunkText")
+                .field("type", "text")
+                .field("analyzer", "ddrag_ik_index")
+                .field("search_analyzer", "ddrag_ik_search")
+                .endObject()
+                .endObject()
                 .endObject();
     }
 
     /**
-     * 构建关键词检索的 bool query（初排阶段）。
+     * 构建关键词检索的 bool query。
      * <p>
      * 四个打分维度：
      * <ol>
@@ -445,32 +433,6 @@ public class ElasticsearchService {
     }
 
     /**
-     * 构建 rescore 精排查询（二次打分阶段）。
-     * <p>
-     * 与初排 {@link #buildBoolQuery} 的区别：
-     * match 子句使用 {@code operator=and} 更严格要求所有词都匹配，
-     * 确保精排阶段返回的结果精确度更高。
-     *
-     * @param question  检索关键词
-     * @param windowSize rescore 窗口大小
-     * @return QueryRescorerBuilder
-     */
-    private QueryRescorerBuilder buildRescoreQuery(String question, int windowSize) {
-        BoolQueryBuilder rescoreBool = QueryBuilders.boolQuery()
-                .should(QueryBuilders.matchPhraseQuery("fileName", question).boost(8f))
-                .should(QueryBuilders.matchQuery("fileName", question).operator(Operator.AND).boost(5f))
-                .should(QueryBuilders.matchPhraseQuery("chunkText", question).boost(7f))
-                .should(QueryBuilders.matchQuery("chunkText", question).operator(Operator.AND).boost(4f))
-                .minimumShouldMatch(1);
-
-        return new QueryRescorerBuilder(rescoreBool)
-                .setQueryWeight(0.2f)
-                .setRescoreQueryWeight(1.0f)
-                .setScoreMode(QueryRescoreMode.Total)
-                .windowSize(windowSize);
-    }
-
-    /**
      * 对日志输出中的问题文本做截断处理，防止超长文本撑爆日志。
      * <p>
      * 规则：合并连续空白 → 超过 120 字符则截断并追加 "..." → 否则原样返回。
@@ -487,7 +449,7 @@ public class ElasticsearchService {
     }
 
     /**
-     * 将 ES 原始相关性分数归一化到 [0, 1] 区间。
+     * 将 ES 原始BM25分数归一化到 [0, 1] 区间。
      * <p>
      * 使用对数变换 {@code log1p(x)} 压缩分数范围，消除不同查询间分数不可比的问题。
      * 公式：{@code min(1.0, log1p(rawScore) / log1p(KEYWORD_SCORE_REFERENCE))}

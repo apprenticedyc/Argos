@@ -23,16 +23,16 @@ public class CitationAssembler {
      * 将检索文档列表组装为引用来源列表。
      * <p>按文件名去重，保留每个文件的第一次命中，保持插入顺序。</p>
      *
-     * @param documents 检索返回的文档列表
+     * @param evidences 检索返回的文档列表
      * @return 去重后的引用来源列表
      */
-    public List<AskQuestionResponse.Citation> assembleDocuments(List<Document> documents) {
-        if (documents == null || documents.isEmpty()) {
+    public List<AskQuestionResponse.Citation> assemble(List<Document> evidences) {
+        if (evidences == null || evidences.isEmpty()) {
             return List.of();
         }
         Map<String, AskQuestionResponse.Citation> citationsByFileName = new LinkedHashMap<>();
-        for (Document document : documents) {
-            AskQuestionResponse.Citation citation = toCitation(document);
+        for (Document evidence : evidences) {
+            AskQuestionResponse.Citation citation = toCitation(evidence);
             if (citation != null) {
                 citationsByFileName.putIfAbsent(citation.fileName(), citation);
             }
@@ -44,16 +44,16 @@ public class CitationAssembler {
      * 将单个检索文档转换为引用来源对象。
      * <p>从文档元数据中提取各字段，若缺少文件名则返回 {@code null}。</p>
      */
-    private AskQuestionResponse.Citation toCitation(Document document) {
-        Map<String, Object> metadata = document.getMetadata();
+    private AskQuestionResponse.Citation toCitation(Document evidence) {
+        Map<String, Object> metadata = evidence.getMetadata();
         String fileName = readFileName(metadata);
         if (!StringUtils.hasText(fileName)) {
             return null;
         }
         return new AskQuestionResponse.Citation(
                 readLong(metadata, "documentId"),
-                readLong(metadata, "chunkId"),
-                readInteger(metadata, "chunkIndex"),
+                readLong(metadata, "primaryChunkId"),
+                readInteger(metadata, "primaryChunkIndex"),
                 fileName,
                 readScore(metadata),
                 null

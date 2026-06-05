@@ -65,33 +65,22 @@ public class HybridRetrievalService {
      * 主构造函数（Spring 注入），使用默认邻居窗口。
      */
     @Autowired
-    public HybridRetrievalService(
-            PgVectorRetriever vectorRetriever,
-            ElasticsearchService elasticsearchService,
-            DocumentChunkMapper documentChunkMapper,
-            QueryPlanningService queryPlanningService) {
-        this(
-                vectorRetriever,
-                elasticsearchService,
-                documentChunkMapper,
-                queryPlanningService,
-                DEFAULT_NEIGHBOR_WINDOW);
+    public HybridRetrievalService(PgVectorRetriever vectorRetriever, ElasticsearchService elasticsearchService,
+                                  DocumentChunkMapper documentChunkMapper, QueryPlanningService queryPlanningService) {
+        this(vectorRetriever, elasticsearchService, documentChunkMapper, queryPlanningService, DEFAULT_NEIGHBOR_WINDOW);
     }
 
     /**
      * 构造函数，支持自定义邻居窗口大小。
      */
-    public HybridRetrievalService(
-            PgVectorRetriever vectorRetriever,
-            ElasticsearchService elasticsearchService,
-            DocumentChunkMapper documentChunkMapper,
-            QueryPlanningService queryPlanningService,
-            int neighborWindow) {
+    public HybridRetrievalService(PgVectorRetriever vectorRetriever, ElasticsearchService elasticsearchService,
+                                  DocumentChunkMapper documentChunkMapper, QueryPlanningService queryPlanningService,
+                                  int neighborWindow) {
         this.vectorRetriever = vectorRetriever;
         this.elasticsearchService = elasticsearchService;
         this.documentChunkMapper = documentChunkMapper;
         this.queryPlanningService = queryPlanningService;
-        this.neighborWindow = Math.max(0, neighborWindow);
+        this.neighborWindow = neighborWindow;
     }
 
     /**
@@ -112,11 +101,9 @@ public class HybridRetrievalService {
         int validTopK = topK > 0 ? topK : 5;
 
         // 1. 查询规划：LLM 决定直接/改写/拆解
-        log.info("混合检索开始: groupId={}, topK={}, questionLength={}", validGroupId, validTopK,
-                normalizedQuestion.length());
+        log.info("混合检索开始: groupId={}, topK={}, questionLength={}", validGroupId, validTopK, normalizedQuestion.length());
         QueryPlanResult queryPlan = queryPlanningService.plan(normalizedQuestion);
-        log.info("查询规划完成: groupId={}, strategy={}, queries={}", validGroupId, queryPlan.strategy(),
-                queryPlan.queries());
+        log.info("查询规划完成: groupId={}, strategy={}, queries={}", validGroupId, queryPlan.strategy(), queryPlan.queries());
 
         // 2. 双路检索：对每个规划查询分别走向量和关键词通道，合并候选
         Map<Long, RetrievalCandidate> candidates = new LinkedHashMap<>();
@@ -127,8 +114,7 @@ public class HybridRetrievalService {
 
         long vectorHitCount = candidates.values().stream().filter(c -> c.vectorMatched).count();
         long keywordHitCount = candidates.values().stream().filter(c -> c.keywordMatched).count();
-        log.info("双路检索完成: groupId={}, candidateCount={}, vectorHits={}, keywordHits={}",
-                validGroupId, candidates.size(), vectorHitCount, keywordHitCount);
+        log.info("双路检索完成: groupId={}, candidateCount={}, vectorHits={}, keywordHits={}", validGroupId, candidates.size(), vectorHitCount, keywordHitCount);
 
         if (candidates.isEmpty()) {
             long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
@@ -136,81 +122,69 @@ public class HybridRetrievalService {
             return RetrievedEvidenceBundle.empty();
         }
 
-        // 3. RRF 融合排序 + 聚类（合并同文档连续 chunk）
+        // 3. 按融合后RRF分数排序，合并同文档连续 chunk
         List<RetrievalCandidate> rankedCandidates = candidates.values().stream()
-                .sorted(Comparator
-                        .comparingDouble(RetrievalCandidate::rankingScore).reversed()
-                        .thenComparing(RetrievalCandidate::chunkId))
-                .limit(validTopK)
-                .toList();
+                .sorted(Comparator.comparingDouble(RetrievalCandidate::RRFScore).reversed()
+                        .thenComparing(RetrievalCandidate::chunkId)).limit(validTopK).toList();
         List<RetrievalCluster> rankedClusters = buildClusters(rankedCandidates);
-        log.info("RRF融合排序完成: groupId={}, rankedCandidates={}, clusters={}",
-                validGroupId, rankedCandidates.size(), rankedClusters.size());
+        log.info("RRF融合排序完成: groupId={}, rankedCandidates={}, clusters={}", validGroupId, rankedCandidates.size(), rankedClusters.size());
 
-        // 4. 证据组装：查询 chunk 元数据，按聚类构建 Document（含邻居窗口扩展）
+        // 4. 证据组装：
+        // 4.1 批量查询所有命中切片的元数据
         List<Long> chunkIds = rankedCandidates.stream().map(RetrievalCandidate::chunkId).toList();
-        Map<Long, Map<String, Object>> rowByChunkId = indexRows(
-                documentChunkMapper.selectQaReadyChunksByIds(validGroupId, chunkIds));
-        Map<Long, List<DocumentChunkEntity>> chunkWindowCache = new LinkedHashMap<>();
-        List<Document> documents = new ArrayList<>();
-        int evidenceIndex = 1;
+        // 存储命中切片对应的元数据
+        Map<Long, Map<String, Object>> chunkId2Metadata = indexRows(documentChunkMapper.selectQaReadyChunksByIds(validGroupId, chunkIds));
+        // 存储某文档对应的所有chunk，避免同一文档重复查 DB
+        Map<Long, List<DocumentChunkEntity>> documentID2AllChunks = new LinkedHashMap<>();
+        // 结果列表
+        List<Document> evidences = new ArrayList<>();
+        // 证据编号。LLM 回答时引用来源就用这个编号
+        int evidenceId = 1;
+
+        // 4.2 遍历排序后的类簇列表，尝试将每个clsuter组成一个 Document 证据
         for (RetrievalCluster cluster : rankedClusters) {
-            Map<String, Object> row = rowByChunkId.get(cluster.primaryChunkId());
-            if (row == null) {
-                continue;
-            }
-            Document document = toDocument("E" + evidenceIndex, row, cluster, chunkWindowCache);
-            if (document == null) {
-                continue;
-            }
-            documents.add(document);
-            evidenceIndex++;
+            // 主要切片的元数据
+            Map<String, Object> primaryChunkData = chunkId2Metadata.get(cluster.primaryChunkId());
+            // 将主要切片作为证据核心，扩展邻居窗口，拼接文本和元数据，组装成 Document 对象
+            Document evidence = buildEvidence("E" + evidenceId, primaryChunkData, cluster, documentID2AllChunks);
+            evidences.add(evidence);
+            // 组装下一条证据
+            evidenceId++;
         }
-        if (documents.isEmpty()) {
+        // 4.3 所有聚类都未能组装成证据，返回空结果
+        if (evidences.isEmpty()) {
             long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
             log.info("混合检索证据组装为空: groupId={}, elapsedMs={}", validGroupId, elapsedMs);
             return RetrievedEvidenceBundle.empty();
         }
         // 5. 证据等级评估：NONE/WEAK/PARTIAL/SUFFICIENT
-        EvidenceLevel evidenceLevel = evaluateEvidenceLevel(documents);
+        EvidenceLevel evidenceLevel = evaluateEvidenceLevel(evidences);
         long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
-        log.info("混合检索完成: groupId={}, evidenceCount={}, evidenceLevel={}, elapsedMs={}",
-                validGroupId, documents.size(), evidenceLevel, elapsedMs);
-        return new RetrievedEvidenceBundle(documents, evidenceLevel, buildEvidenceGuidance(evidenceLevel));
+        log.info("混合检索完成: groupId={}, evidenceCount={}, evidenceLevel={}, elapsedMs={}", validGroupId, evidences.size(), evidenceLevel, elapsedMs);
+        return new RetrievedEvidenceBundle(evidences, evidenceLevel, buildEvidenceGuidance(evidenceLevel));
     }
 
     /** 合并向量检索结果到候选集合，累加 RRF 评分 */
-    private void mergeVectorHits(
-            Map<Long, RetrievalCandidate> candidates,
-            Long groupId,
-            String query) {
+    private void mergeVectorHits(Map<Long, RetrievalCandidate> candidates, Long groupId, String query) {
         // 1. 向量通道检索 top-K
         List<PgVectorRetriever.VectorHit> vectorHits = vectorRetriever.search(groupId, query, CHANNEL_TOP_K);
         for (int index = 0; index < vectorHits.size(); index++) {
             PgVectorRetriever.VectorHit hit = vectorHits.get(index);
             // 2 遍历向量检索结果，每个chunkId包装为一个检索候选项
-            RetrievalCandidate candidate = candidates.computeIfAbsent(
-                    hit.chunkId(),
-                    chunkId -> RetrievalCandidate.fromVectorHit(hit));
+            RetrievalCandidate candidate = candidates.computeIfAbsent(hit.chunkId(), chunkId -> RetrievalCandidate.fromVectorHit(hit));
             // 3. 给候选项计算RRF分数：1/(rank+60)
             candidate.mergeVectorHit(hit, index + 1);
         }
     }
 
     /** 合并关键词检索结果到候选集合，累加 RRF 评分 */
-    private void mergeKeywordHits(
-            Map<Long, RetrievalCandidate> candidates,
-            Long groupId,
-            String query) {
+    private void mergeKeywordHits(Map<Long, RetrievalCandidate> candidates, Long groupId, String query) {
         // 1. 关键词通道检索 top-K
-        List<ElasticsearchService.KeywordHit> keywordHits = elasticsearchService.search(groupId,
-                query, CHANNEL_TOP_K);
+        List<ElasticsearchService.KeywordHit> keywordHits = elasticsearchService.search(groupId, query, CHANNEL_TOP_K);
         for (int index = 0; index < keywordHits.size(); index++) {
             ElasticsearchService.KeywordHit hit = keywordHits.get(index);
             // 2. 按 chunkId 去重，已有则复用（与向量通道共享同一 candidates Map）
-            RetrievalCandidate candidate = candidates.computeIfAbsent(
-                    hit.chunkId(),
-                    chunkId -> RetrievalCandidate.fromKeywordHit(hit));
+            RetrievalCandidate candidate = candidates.computeIfAbsent(hit.chunkId(), chunkId -> RetrievalCandidate.fromKeywordHit(hit));
             // 3. 累加 RRF 分数，同时被两个通道命中的 chunk 分数叠加，排名更靠前
             candidate.mergeKeywordHit(hit, index + 1);
         }
@@ -226,68 +200,65 @@ public class HybridRetrievalService {
     }
 
     /** 将检索候选和数据库数据组装为 Spring AI 的 Document 对象 */
-    private Document toDocument(
-            String evidenceId,
-            Map<String, Object> row,
-            RetrievalCluster cluster,
-            Map<Long, List<DocumentChunkEntity>> chunkWindowCache) {
-        Long documentId = requireLong(getValue(row, "documentId"), "documentId");
-        Integer chunkIndex = requireInteger(getValue(row, "chunkIndex"), "chunkIndex");
-        if (!documentId.equals(cluster.documentId()) || !chunkIndex.equals(cluster.primaryChunkIndex())) {
-            throw new BusinessException("检索结果与文档切片不一致");
-        }
-        Long chunkId = requireLong(getValue(row, "chunkId"), "chunkId");
-        String fileName = requireText(getValue(row, "fileName"), "fileName");
+    private Document buildEvidence(String evidenceId, Map<String, Object> primaryChunkData, RetrievalCluster cluster,
+                                   Map<Long, List<DocumentChunkEntity>> chunkWindowCache) {
+        Long documentId = requireLong(getValue(primaryChunkData, "documentId"), "documentId");
+        String fileName = requireText(getValue(primaryChunkData, "fileName"), "fileName");
+        // 构建证据元数据，包含检索相关信息和切片位置信息，供 LLM 理解和引用
         Map<String, Object> metadata = new LinkedHashMap<>();
         metadata.put("evidenceId", evidenceId);
-        metadata.put("groupId", requireLong(getValue(row, "groupId"), "groupId"));
+        metadata.put("groupId", requireLong(getValue(primaryChunkData, "groupId"), "groupId"));
         metadata.put("documentId", documentId);
-        metadata.put("chunkId", chunkId);
-        metadata.put("chunkIndex", chunkIndex);
         metadata.put("primaryChunkId", cluster.primaryChunkId());
         metadata.put("primaryChunkIndex", cluster.primaryChunkIndex());
         metadata.put("startChunkIndex", cluster.expandedStartChunkIndex(neighborWindow));
         metadata.put("endChunkIndex", cluster.expandedEndChunkIndex(neighborWindow));
         metadata.put("fileName", fileName);
-        double normalizedScore = normalizeScore(cluster.rankingScore());
-        metadata.put("score", normalizedScore);
+        metadata.put("score", normalizeScore(cluster.RRFMAXScore()));
         metadata.put("retrievalSource", cluster.source());
-        metadata.put("vectorScore", cluster.vectorScore());
-        metadata.put("keywordScore", cluster.keywordScore());
-        metadata.put("hybridScore", cluster.rankingScore());
-        String evidenceText = buildEvidenceWindow(row, cluster, chunkWindowCache);
+        metadata.put("vectorScore", cluster.vectorMAXScore());
+        metadata.put("keywordScore", cluster.keywordMAXScore());
+        metadata.put("hybridScore", cluster.RRFMAXScore());
+        // 拼接证据文本，组合多个相邻切片为一个上下文窗口
+        String evidenceText = buildEvidenceText(primaryChunkData, cluster, chunkWindowCache);
         if (!StringUtils.hasText(evidenceText)) {
             return null;
         }
-        return Document.builder()
-                .id(evidenceId)
-                .text(evidenceText)
-                .metadata(metadata)
-                .build();
+        return Document.builder().id(evidenceId).text(evidenceText).metadata(metadata).build();
     }
 
-    /** 构建证据窗口文本：根据聚类的切片范围和邻居窗口拼接切片文本 */
-    private String buildEvidenceWindow(
-            Map<String, Object> row,
-            RetrievalCluster cluster,
-            Map<Long, List<DocumentChunkEntity>> chunkWindowCache) {
-        Long groupId = requireLong(getValue(row, "groupId"), "groupId");
-        Long documentId = requireLong(getValue(row, "documentId"), "documentId");
-        String fileName = requireText(getValue(row, "fileName"), "fileName");
-        List<DocumentChunkEntity> chunks = chunkWindowCache.computeIfAbsent(
-                documentId,
-                ignored -> documentChunkMapper.selectReadyActiveChunksByDocumentId(groupId, documentId));
+    /**
+     * 构建证据窗口文本：以聚类的切片范围为锚点，向前后各扩展 neighborWindow 个切片，
+     * 拼接为完整的上下文文本，供 LLM 阅读理解。
+     *
+     * @param primaryChunkData              聚类主切片的 DB 记录（含 groupId、documentId、fileName 等）
+     * @param cluster          检索聚类，包含切片范围和分数信息
+     * @param chunkWindowCache 文档切片缓存，避免同一文档重复查 DB
+     * @return 拼接后的证据文本，格式为 "文件名：xxx\n切片文本1\n切片文本2\n..."；无法拼接时返回 null
+     */
+    private String buildEvidenceText(Map<String, Object> primaryChunkData, RetrievalCluster cluster,
+                                     Map<Long, List<DocumentChunkEntity>> chunkWindowCache) {
+        Long groupId = requireLong(getValue(primaryChunkData, "groupId"), "groupId");
+        Long documentId = requireLong(getValue(primaryChunkData, "documentId"), "documentId");
+        String fileName = requireText(getValue(primaryChunkData, "fileName"), "fileName");
+        // 从缓存取该文档的全部切片，缓存未命中则查 DB
+        List<DocumentChunkEntity> chunks = chunkWindowCache.get(documentId);
+        if (chunks == null) {
+            // 查某个文档的全部切片完整记录
+            chunks = documentChunkMapper.selectReadyActiveChunksByDocumentId(groupId, documentId);
+            chunkWindowCache.put(documentId, chunks);
+        }
         if (chunks.isEmpty()) {
             return null;
         }
-        int startIndex = cluster.expandedStartChunkIndex(neighborWindow);
-        int endIndex = cluster.expandedEndChunkIndex(neighborWindow);
+        // 计算扩展后的窗口范围：聚类切片范围 + 前后各 neighborWindow 个切片
+        int start = cluster.expandedStartChunkIndex(neighborWindow);
+        int end = cluster.expandedEndChunkIndex(neighborWindow);
+        // 遍历全部切片，只保留窗口范围内的，按顺序拼接 chunkText
         StringBuilder builder = new StringBuilder();
         for (DocumentChunkEntity chunk : chunks) {
-            if (chunk.getChunkIndex() != null
-                    && chunk.getChunkIndex() >= startIndex
-                    && chunk.getChunkIndex() <= endIndex
-                    && StringUtils.hasText(chunk.getChunkText())) {
+            if (chunk.getChunkIndex() != null && chunk.getChunkIndex() >= start && chunk.getChunkIndex() <= end && StringUtils.hasText(chunk.getChunkText())) {
+                // 拼完一个chunk换一行
                 if (!builder.isEmpty()) {
                     builder.append("\n");
                 }
@@ -300,17 +271,24 @@ public class HybridRetrievalService {
         return "文件名：" + fileName + "\n" + builder;
     }
 
-    /** 将候选切片聚合为类簇：同一文档中连续的切片合并为一个类簇 */
+    /**
+     * 一文档中连续的切片合并为一个聚类
+     * <p>
+     * 作用：避免给 LLM 返回同一文档的零散切片，而是把相邻切片拼成完整的上下文片段，
+     * 提升 LLM 回答的连贯性和准确性。
+     */
     private List<RetrievalCluster> buildClusters(List<RetrievalCandidate> rankedCandidates) {
+        // 按 documentId 分组
         Map<Long, List<RetrievalCandidate>> candidatesByDocumentId = new LinkedHashMap<>();
         for (RetrievalCandidate candidate : rankedCandidates) {
-            candidatesByDocumentId.computeIfAbsent(candidate.documentId(), ignored -> new ArrayList<>()).add(candidate);
+            candidatesByDocumentId.computeIfAbsent(candidate.documentId(), id -> new ArrayList<>()).add(candidate);
         }
         List<RetrievalCluster> clusters = new ArrayList<>();
         for (List<RetrievalCandidate> sameDocumentCandidates : candidatesByDocumentId.values()) {
+            // 同文档内按 chunkIndex 排序，保证切片顺序正确
             List<RetrievalCandidate> sortedByChunkIndex = sameDocumentCandidates.stream()
-                    .sorted(Comparator.comparing(RetrievalCandidate::chunkIndex))
-                    .toList();
+                    .sorted(Comparator.comparing(RetrievalCandidate::chunkIndex)).toList();
+            // 遍历排序后的切片，连续的归入同一个组合，不连续则新建一个组合
             RetrievalCluster currentCluster = null;
             for (RetrievalCandidate candidate : sortedByChunkIndex) {
                 if (currentCluster == null || !currentCluster.isContinuousWith(candidate)) {
@@ -321,37 +299,44 @@ public class HybridRetrievalService {
                 currentCluster.add(candidate);
             }
         }
-        return clusters.stream()
-                .sorted(Comparator
-                        .comparingDouble(RetrievalCluster::rankingScore).reversed()
-                        .thenComparing(RetrievalCluster::primaryChunkId))
-                .toList();
+        // 按融合分数降序排列，分数相同则按 chunkId 排序保证稳定性
+        return clusters.stream().sorted(Comparator.comparingDouble(RetrievalCluster::RRFMAXScore).reversed()
+                .thenComparing(RetrievalCluster::primaryChunkId)).toList();
     }
 
-    /** 评估检索结果的证据充分度等级 */
-    private EvidenceLevel evaluateEvidenceLevel(List<Document> documents) {
-        if (documents.isEmpty()) {
+    /**
+     * 评估检索结果的证据充分度等级。
+     * <p>
+     * 根据证据数量、检索来源和最高分数三个维度综合判断：
+     * <ul>
+     *   <li>NONE — 无证据</li>
+     *   <li>WEAK — 单条证据，或仅单通道命中</li>
+     *   <li>PARTIAL — 有多条证据，或有双通道命中</li>
+     *   <li>SUFFICIENT — 多条证据 + 双通道命中，或高分向量命中</li>
+     * </ul>
+     */
+    private EvidenceLevel evaluateEvidenceLevel(List<Document> evidences) {
+        if (evidences.isEmpty()) {
             return EvidenceLevel.NONE;
         }
-        boolean hasBothSource = documents.stream()
-                .map(document -> document.getMetadata().get("retrievalSource"))
+        // 是否存在双通道（向量+关键词）命中的证据
+        boolean hasBothSource = evidences.stream().map(document -> document.getMetadata().get("retrievalSource"))
                 .anyMatch("BOTH"::equals);
-        boolean hasVectorEvidence = documents.stream()
-                .map(document -> document.getMetadata().get("retrievalSource"))
+        // 是否存在向量通道命中的证据（VECTOR 或 BOTH）
+        boolean hasVectorEvidence = evidences.stream().map(document -> document.getMetadata().get("retrievalSource"))
                 .anyMatch(source -> "VECTOR".equals(source) || "BOTH".equals(source));
-        double topScore = documents.stream()
-                .map(document -> document.getMetadata().get("score"))
-                .filter(Double.class::isInstance)
-                .map(Double.class::cast)
-                .max(Double::compareTo)
-                .orElse(0D);
-        // 归一化后 score ≥ 0.85 对应双通道 rank-1 或多次高排名命中
-        if (documents.size() >= 2 && (hasBothSource || (hasVectorEvidence && topScore >= 0.85D))) {
+        // 取所有证据中的最高归一化分数
+        double topScore = evidences.stream().map(document -> document.getMetadata().get("score"))
+                .filter(Double.class::isInstance).map(Double.class::cast).max(Double::compareTo).orElse(0D);
+        // 充分：多条证据 + 双通道命中；或高分向量命中（≥0.85 对应双通道 rank-1）
+        if (evidences.size() >= 2 && (hasBothSource || (hasVectorEvidence && topScore >= 0.85D))) {
             return EvidenceLevel.SUFFICIENT;
         }
-        if (hasBothSource || documents.size() >= 2) {
+        // 部分：有双通道命中，或多条证据
+        if (hasBothSource || evidences.size() >= 2) {
             return EvidenceLevel.PARTIAL;
         }
+        // 弱：单条单通道命中
         return EvidenceLevel.WEAK;
     }
 
@@ -457,7 +442,7 @@ public class HybridRetrievalService {
         /** 关键词检索评分（取多次命中的最大值） */
         private double keywordScore;
         /** RRF 融合评分（累加值） */
-        private double rankingScore;
+        private double RRFScore;
         /** 是否在向量检索中命中 */
         private boolean vectorMatched;
         /** 是否在关键词检索中命中 */
@@ -483,14 +468,14 @@ public class HybridRetrievalService {
         void mergeVectorHit(PgVectorRetriever.VectorHit hit, int rank) {
             this.vectorMatched = true;
             this.vectorScore = Math.max(this.vectorScore, hit.score());
-            this.rankingScore += reciprocalRank(rank) * VECTOR_WEIGHT;
+            this.RRFScore += reciprocalRank(rank) * VECTOR_WEIGHT;
         }
 
         /** 合并关键词检索命中：更新评分并累加 RRF 分数 */
         void mergeKeywordHit(ElasticsearchService.KeywordHit hit, int rank) {
             this.keywordMatched = true;
             this.keywordScore = Math.max(this.keywordScore, hit.normalizedScore());
-            this.rankingScore += reciprocalRank(rank) * KEYWORD_WEIGHT;
+            this.RRFScore += reciprocalRank(rank) * KEYWORD_WEIGHT;
         }
 
         Long documentId() {
@@ -513,8 +498,8 @@ public class HybridRetrievalService {
             return keywordScore;
         }
 
-        double rankingScore() {
-            return rankingScore;
+        double RRFScore() {
+            return RRFScore;
         }
 
         /** 获取检索来源：BOTH（双通道）、VECTOR 或 KEYWORD */
@@ -549,12 +534,12 @@ public class HybridRetrievalService {
         private int startChunkIndex;
         /** 类簇的结束切片序号 */
         private int endChunkIndex;
-        /** 类簇的 RRF 融合评分（取成员最大值） */
-        private double rankingScore;
+        /** 类簇的 RRF 融合评分（取组内某个chunk的最大值） */
+        private double RRFMAXScore;
         /** 类簇的向量检索评分（取成员最大值） */
-        private double vectorScore;
+        private double vectorMAXScore;
         /** 类簇的关键词检索评分（取成员最大值） */
-        private double keywordScore;
+        private double keywordMAXScore;
         /** 类簇是否包含向量检索命中的成员 */
         private boolean hasVectorSource;
         /** 类簇是否包含关键词检索命中的成员 */
@@ -567,7 +552,7 @@ public class HybridRetrievalService {
             add(seed);
         }
 
-        /** 判断候选切片是否与当前类簇连续（同文档且序号相邻） */
+        /** 判断候选切片是否与当前组是否连续（同文档且序号相邻） */
         boolean isContinuousWith(RetrievalCandidate candidate) {
             return documentId.equals(candidate.documentId()) && candidate.chunkIndex() == endChunkIndex + 1;
         }
@@ -577,17 +562,12 @@ public class HybridRetrievalService {
             members.add(candidate);
             endChunkIndex = Math.max(endChunkIndex, candidate.chunkIndex());
             startChunkIndex = Math.min(startChunkIndex, candidate.chunkIndex());
-            rankingScore = Math.max(rankingScore, candidate.rankingScore());
-            vectorScore = Math.max(vectorScore, candidate.vectorScore());
-            keywordScore = Math.max(keywordScore, candidate.keywordScore());
-            hasVectorSource = hasVectorSource || "VECTOR".equals(candidate.source())
-                    || "BOTH".equals(candidate.source());
-            hasKeywordSource = hasKeywordSource || "KEYWORD".equals(candidate.source())
-                    || "BOTH".equals(candidate.source());
-            if (primaryCandidate == null
-                    || candidate.rankingScore() > primaryCandidate.rankingScore()
-                    || (candidate.rankingScore() == primaryCandidate.rankingScore()
-                            && candidate.chunkIndex() < primaryCandidate.chunkIndex())) {
+            RRFMAXScore = Math.max(RRFMAXScore, candidate.RRFScore());
+            vectorMAXScore = Math.max(vectorMAXScore, candidate.vectorScore());
+            keywordMAXScore = Math.max(keywordMAXScore, candidate.keywordScore());
+            hasVectorSource = hasVectorSource || "VECTOR".equals(candidate.source()) || "BOTH".equals(candidate.source());
+            hasKeywordSource = hasKeywordSource || "KEYWORD".equals(candidate.source()) || "BOTH".equals(candidate.source());
+            if (primaryCandidate == null || candidate.RRFScore() > primaryCandidate.RRFScore() || (candidate.RRFScore() == primaryCandidate.RRFScore() && candidate.chunkIndex() < primaryCandidate.chunkIndex())) {
                 primaryCandidate = candidate;
             }
         }
@@ -604,26 +584,26 @@ public class HybridRetrievalService {
             return primaryCandidate.chunkIndex();
         }
 
-        double rankingScore() {
-            return rankingScore;
+        double RRFMAXScore() {
+            return RRFMAXScore;
         }
 
-        double vectorScore() {
-            return vectorScore;
+        double vectorMAXScore() {
+            return vectorMAXScore;
         }
 
-        double keywordScore() {
-            return keywordScore;
+        double keywordMAXScore() {
+            return keywordMAXScore;
         }
 
         /** 获取扩展后的起始切片序号（向前扩展 neighborWindow 个切片，最小为 0） */
         int expandedStartChunkIndex(int neighborWindow) {
-            return Math.max(0, startChunkIndex - Math.max(0, neighborWindow));
+            return Math.max(0, startChunkIndex - neighborWindow);
         }
 
         /** 获取扩展后的结束切片序号（向后扩展 neighborWindow 个切片） */
         int expandedEndChunkIndex(int neighborWindow) {
-            return endChunkIndex + Math.max(0, neighborWindow);
+            return endChunkIndex + neighborWindow;
         }
 
         /** 获取类簇的检索来源：BOTH（双通道）、VECTOR 或 KEYWORD */

@@ -26,7 +26,7 @@ public class QaRetrievalService {
     /** 执行知识库检索，返回证据束和引用列表 */
     public QaRetrievalResult retrieveEvidence(Long groupId, String query) {
         RetrievedEvidenceBundle bundle = documentRetriever.retrieveEvidence(groupId, query);
-        List<AskQuestionResponse.Citation> citations = citationAssembler.assembleDocuments(bundle.documents());
+        List<AskQuestionResponse.Citation> citations = citationAssembler.assemble(bundle.documents());
         return new QaRetrievalResult(bundle, citations);
     }
 
